@@ -6,10 +6,10 @@ import {
   Text,
   TouchableHighlight,
   View,
+  Alert,
 } from 'react-native';
 import { Asset } from 'expo-asset';
 import { Audio } from 'expo-av';
-import * as FileSystem from 'expo-file-system';
 import * as Font from 'expo-font';
 import * as Permissions from 'expo-permissions';
 
@@ -24,7 +24,6 @@ class Icon {
 
 const ICON_RECORD_BUTTON = new Icon(require('./assets/images/record_button.png'), 70, 119);
 const ICON_RECORDING = new Icon(require('./assets/images/record_icon.png'), 20, 14);
-
 const { height: DEVICE_HEIGHT } = Dimensions.get('window');
 const BACKGROUND_COLOR = '#FFF8ED';
 const LIVE_COLOR = '#FF0000';
@@ -38,17 +37,9 @@ export default class App extends React.Component {
     this.state = {
       haveRecordingPermissions: false,
       isLoading: false,
-      isPlaybackAllowed: false,
-      muted: false,
-      soundPosition: null,
-      soundDuration: null,
       recordingDuration: null,
-      shouldPlay: false,
       isRecording: false,
       fontLoaded: false,
-      shouldCorrectPitch: true,
-      volume: 1.0,
-      name: "Identify Your Sound"
     };
     
     Audio.RECORDING_OPTIONS_PRESET_LOW_QUALITY.ios.extension = '.wav'
@@ -58,8 +49,6 @@ export default class App extends React.Component {
 
   componentDidMount() {
     (async () => {
-
-      
       await Font.loadAsync({
         'cutive-mono-regular': require('./assets/fonts/CutiveMono-Regular.ttf'),
       });
@@ -68,34 +57,12 @@ export default class App extends React.Component {
     this._askForPermissions();
   }
 
+  // asks user for mic permission
   _askForPermissions = async () => {
     const response = await Permissions.askAsync(Permissions.AUDIO_RECORDING);
     this.setState({
       haveRecordingPermissions: response.status == 'granted',
     });
-  };
-
-  _updateScreenForSoundStatus = status => {
-    if (status.isLoaded) {
-      this.setState({
-        soundDuration: status.durationMillis,
-        soundPosition: status.positionMillis,
-        shouldPlay: status.shouldPlay,
-        muted: status.isMuted,
-        volume: status.volume,
-        shouldCorrectPitch: status.shouldCorrectPitch,
-        isPlaybackAllowed: true,
-      });
-    } else {
-      this.setState({
-        soundDuration: null,
-        soundPosition: null,
-        isPlaybackAllowed: false,
-      });
-      if (status.error) {
-        console.log(`FATAL PLAYER ERROR: ${status.error}`);
-      }
-    }
   };
 
   _updateScreenForRecordingStatus = status => {
@@ -110,7 +77,7 @@ export default class App extends React.Component {
         recordingDuration: status.durationMillis,
       });
       if (!this.state.isLoading) {
-        this._stopRecordingAndEnablePlayback();
+        this._stopRecordingAndReturnPrediction();
       }
     }
   };
@@ -119,11 +86,7 @@ export default class App extends React.Component {
     this.setState({
       isLoading: true,
     });
-    if (this.sound !== null) {
-      await this.sound.unloadAsync();
-      this.sound.setOnPlaybackStatusUpdate(null);
-      this.sound = null;
-    }
+    
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       interruptionModeIOS: Audio.INTERRUPTION_MODE_IOS_DO_NOT_MIX,
@@ -133,38 +96,37 @@ export default class App extends React.Component {
       playThroughEarpieceAndroid: false,
       staysActiveInBackground: true,
     });
+
     if (this.recording !== null) {
       this.recording.setOnRecordingStatusUpdate(null);
       this.recording = null;
     }
 
+    // creates new recording and beings recording 
     const recording = new Audio.Recording();
     await recording.prepareToRecordAsync(this.recordingSettings);
     recording.setOnRecordingStatusUpdate(this._updateScreenForRecordingStatus);
 
     this.recording = recording;
-    await this.recording.startAsync(); // Will call this._updateScreenForRecordingStatus to update the screen.
+    await this.recording.startAsync(); 
     this.setState({
       isLoading: false,
     });
   }
 
-  async _stopRecordingAndEnablePlayback() {
+  // stops the recording and returns the prediction
+  async _stopRecordingAndReturnPrediction(number) {
     this.setState({
       isLoading: true,
     });
     try {
       await this.recording.stopAndUnloadAsync();
     } catch (error) {
-      // Do nothing -- we are already unloaded.
     }
 
-    const info = await FileSystem.getInfoAsync(this.recording.getURI());
-    console.log(`FILE INFO: ${JSON.stringify(info)}`);
-
-    const uri = this.recording.getURI();
-
+    // formats POST request and receives JSON response
     // https://github.com/expo/expo/issues/214#issuecomment-316950941
+    const uri = this.recording.getURI();
     let apiUrl = "http://192.168.1.192:5000/model/predict?start_time=0";
     let uriParts = uri.split('.');
     let fileType = uriParts[uriParts.length - 1];
@@ -176,8 +138,6 @@ export default class App extends React.Component {
     type: `audio/${fileType}`,
     });
 
-    console.log(JSON.stringify(formData))
-
     let options = {
     method: 'POST',
     body: formData,
@@ -186,49 +146,67 @@ export default class App extends React.Component {
       'Content-Type': 'multipart/form-data',
     },
     };
-
-    console.log("POSTing " + uri + " to " + apiUrl);
     
     response = await fetch(apiUrl, options);
     const json = await response.json();
-    console.log(json)
+    console.log(json);
 
-    await Audio.setAudioModeAsync({
-      allowsRecordingIOS: false,
-      interruptionModeIOS: Audio.INTERRUPTION_MODE_IOS_DO_NOT_MIX,
-      playsInSilentModeIOS: true,
-      playsInSilentLockedModeIOS: true,
-      shouldDuckAndroid: true,
-      interruptionModeAndroid: Audio.INTERRUPTION_MODE_ANDROID_DO_NOT_MIX,
-      playThroughEarpieceAndroid: false,
-      staysActiveInBackground: true,
-    });
+    // if recording too short, alerts user of error
+    if (json.status == "error") {
+      Alert.alert("Error", "Invalid Recording Time, Please Try Again");
+      this.setState({
+        isLoading: false,
+      });
+      return;
+    }
 
-    const { sound, status } = await this.recording.createNewLoadedSoundAsync(
-      {
-        isLooping: true,
-        isMuted: this.state.muted,
-        volume: this.state.volume,
-        rate: this.state.rate,
-        shouldCorrectPitch: this.state.shouldCorrectPitch,
-      },
-      this._updateScreenForSoundStatus
-    );
+    // Alert to ask user how many predictions they want to receive
+    const AsyncAlert = () => {
+      return new Promise((resolve, reject) => {
+          Alert.alert(
+              '# of Predictions',
+              'Please choose how many predictions you want to receive:',
+              [
+                  {text: '1', onPress: () => resolve(1) },
+                  {text: '2', onPress: () => resolve(2) },
+                  {text: '3', onPress: () => resolve(3) },
+                  {text: '4', onPress: () => resolve(4) },
+                  {text: '5', onPress: () => resolve(5) },
+              ],
+              { cancelable: false }
+          )
+      })
+    }    
+    const predictionsWanted = await AsyncAlert()
+   
+    // formats the predictions that will be shown to user
+    var returnedPrediction = "\n" 
+    for(let i = 0; i < predictionsWanted; i++ )
+    {
+      returnedPrediction += "Prediction " + (i+1) + ": " + json.predictions[i].label + "\n" + "Probability: " 
+                            + Math.floor((json.predictions[i].probability) * 100) + "%" + "\n\n";
+    }
 
-    this.sound = sound;
+    // show user the predictions
+    Alert.alert(
+      "Predictions of Sounds Around You:",
+      returnedPrediction)
+
     this.setState({
       isLoading: false,
     });
   }
 
+  // when the record button is pressed
   _onRecordPressed = () => {
     if (this.state.isRecording) {
-      this._stopRecordingAndEnablePlayback();
+      this._stopRecordingAndReturnPrediction();
     } else {
       this._stopPlaybackAndBeginRecording();
     }
   };
 
+  // converts to minutes/seconds form
   _getMMSSFromMillis(millis) {
     const totalSeconds = millis / 1000;
     const seconds = Math.floor(totalSeconds % 60);
@@ -241,29 +219,16 @@ export default class App extends React.Component {
       }
       return string;
     };
+
     return padWithZero(minutes) + ':' + padWithZero(seconds);
   }
 
+  // gets the timestamp of recoridng
   _getRecordingTimestamp() {
     if (this.state.recordingDuration != null) {
       return `${this._getMMSSFromMillis(this.state.recordingDuration)}`;
     }
     return `${this._getMMSSFromMillis(0)}`;
-  }
-
-  async _fetchResults() {
-    const body = new FormData
-    body.append("audio", this.uri + "type=audio/wav")
-
-    const response = await fetch("http://192.168.1.192:5000/model/predict", {
-      body,
-      headers: {
-        "Content-Type": "multipart/form-data"
-      },
-      method: "POST"
-    })
-
-    console.log(response.json())
   }
 
   render() {
@@ -312,27 +277,22 @@ export default class App extends React.Component {
               <View style={styles.recordingDataRowContainer}>
                 <Image
                   style={[styles.image, { opacity: this.state.isRecording ? 1.0 : 0.0 }]}
-                  source={ICON_RECORDING.module}
-                />
+                  source={ICON_RECORDING.module} />
                 <Text style={[styles.recordingTimestamp, { fontFamily: 'cutive-mono-regular' }]}>
                   {this._getRecordingTimestamp()}
                 </Text>
               </View>
-              <View />
+              <View/>
             </View>
             <View />
           </View>
-          <TouchableHighlight
-              underlayColor={BACKGROUND_COLOR}
-              style={styles.recordButton}
-              onPress={this._fetchResults}
-              disabled={this.sound == null}>
-              <Text style = {[styles.recordText, { fontFamily: 'cutive-mono-regular' }]}> IDENTIFY </Text>
-            </TouchableHighlight>
+                <Text> Record to Receive Predictions </Text>
+                <Text> of the Sounds Around You </Text> 
           <View />
         </View>
-          <View />
-          </View>
+      <View/>
+    </View>
+
     );
   }
 }
@@ -355,7 +315,6 @@ const styles = StyleSheet.create({
   noPermissionsText: {
     textAlign: 'center',
   },
-  wrapper: {},
   halfScreenContainer: {
     flex: 1,
     flexDirection: 'column',
@@ -364,12 +323,6 @@ const styles = StyleSheet.create({
     alignSelf: 'stretch',
     minHeight: DEVICE_HEIGHT / 2.0,
     maxHeight: DEVICE_HEIGHT / 2.0,
-  },
-  titleText: {
-    color: '#000000',
-    fontSize: 20,
-    position: 'absolute', 
-    fontWeight: 'bold',
   },
   recordButton: {
     backgroundColor: "#000000",
@@ -387,8 +340,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     alignSelf: 'stretch',
-    minHeight: ICON_RECORD_BUTTON.height,
-    maxHeight: ICON_RECORD_BUTTON.height,
   },
   recordingDataContainer: {
     flex: 1,
